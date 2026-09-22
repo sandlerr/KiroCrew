@@ -1975,6 +1975,7 @@ class DashboardConfig:
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
+    crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
     tips_enabled: bool = True      # feature-discovery tips (GET /api/tips/next); live-read
     tips_cadence_hours: float = 6.0    # min hours between surfaced tips (server-side gate; clamped >= 0)
     tips_snooze_hours: float = 48.0    # hours before a snoozed tip is eligible again (clamped >= 0)
@@ -2633,6 +2634,87 @@ Kiro Crew value on collision, and reports unsupported or secret-bearing source
 settings without copying them. Foreign credentials, security policy,
 approval/sandbox settings, agent/runtime state, hooks, and arbitrary unknown
 config sections cannot enter configuration through this path.
+
+### Meet CrewMates first-run state
+
+`DashboardConfig.crewmates_onboarded` records that the four-step "Meet CrewMates"
+flow (`website/src/components/MeetCrewmatesFlow.tsx`) was finished or dismissed.
+The flow fires once, after the other first-run chapters, only while the Crew
+Members preview (`PREVIEW_CREW`, Settings → Developer → Feature Previews — the
+switch that shows the Crewmates page) is on, and only for a workspace with no
+crewmate beyond the `default` row and no installed agent beyond the ones
+Kiro Crew itself wrote -- judged solely by the server's `kirocrew_owned` flag on
+each `GET /api/agents/installed` row (`useMeetCrewmatesGate`); a row without the
+flag is a custom agent; an existing user with custom agents is never shown
+the flow -- their earlier-sync crewmates are the launch migration's job
+(`docs/request-for-change/rfc-crewmates-launch.md`, "Existing installs"; no
+user-facing step exists for them), and a gate that cannot read the roster or
+the agent list fails safe by not firing. `POST /api/agents` now refuses a crew name that fails the shared agent-name
+grammar (`validation._AGENT_NAME_RE`, code `invalid_agent_name`), because `GET
+/api/members` skips such a row and the crew would exist with no roster able to
+show it; the rule lives at that route, for every client of it -- `kirocrew agent
+create` (`cli_commands.py`) still writes a name unchecked, a pre-existing level
+this change leaves as it is. The flow previews the
+same grammar under the name field as the user types (a plain hint, not an
+`ErrorNotice`; `test/test_meet_crewmates_builtin_pin.py` keeps the copy honest)
+and disables Next until it passes; a server `invalid_agent_name` or 409
+`agent_exists` lands as an `ErrorNotice` under the same field. A failed eligibility
+read (roster or installed agents) is surfaced by App as a dismissible
+`ErrorNotice` (`MeetCrewmatesEligibilityNotice`) rather than silently leaving
+the chapter unfired; the Crew Members page entry works regardless. No notice in
+this first-run flow offers the agent hand-off, by decision: the user has not met
+the agent yet, and on steps 2-3 the typed name and job would be lost. Its Create step is two
+existing writes — `POST /api/agents` (the crewmate, job text stored as
+`description`) and `POST /api/crons` with `member_id` naming the crewmate so the
+schedule runs on the crewmate's own memory. Delivery is mechanical, never an
+instruction to the model: the job is created non-`silent`, so every run rings
+the dashboard bell and — when Slack is connected — reaches the owner's Slack DM
+through the runtime's own leg (the flow's Slack row therefore only states that
+fact; it is not a switch), and "Its own chat" maps to `hide_in_chat`, the one
+delivery choice the runtime actually offers. The crewmate's identity is held
+only from a clean create response -- the immutable `member_id` the server
+allocates with its member memory, which `POST /api/agents` now returns beside
+`memory_store` -- and it is the one thing the flow binds to or reconciles
+against later; nothing is ever claimed by display NAME, because two
+openings prefill the same example name and a same-named crewmate the flow
+cannot prove it made is someone else's. So a 409 `agent_exists` is a taken name
+on every attempt (step 2, error under the field), a create the server refused
+(any other 4xx) says "could not be created" inline, and a create with no usable
+answer (a dropped response, a 5xx) stops on step 3 with a block notice that the
+crewmate "may or may not have been created", posts no schedule, and carries a
+button to the Crewmates page (leaving completes the flow) so the user checks
+before making a second one. The schedule is posted with `member_id` = that
+identity, never the display name (a name is late-resolved on the server, so a
+crewmate deleted and remade under the same name between the two writes would
+otherwise receive the job; the identity resolves to exactly the crewmate just
+made, or to nothing). A schedule write the server refused
+(4xx) is reported as "not saved"; any other failure after the request left (a
+dropped response, a 5xx) is reconciled against `GET /api/crons`, and only a job
+that IS the one asked for counts -- `member_id` equal to the held identity, the
+same name, the same message and the same schedule; an older or foreign job on
+the crewmate is not evidence that this write landed -- so only when nothing matches, or that read fails, is it
+reported as "may not have been saved", with a button to the Schedule page on
+the notice (leaving completes the flow) rather than inviting a duplicate. "Only when I ask" posts no schedule and step 4 then
+says nothing about reports or the Schedule page. A refused `crewmates_onboarded`
+write at create time already counts as the flow's one tolerated failure, so the
+next exit closes it even if the write fails again. The flag is written through
+`PUT /api/config/theme` the moment the crewmate exists (the flow stays open for
+its ready step) or the user leaves.
+The Crewmates page re-opens the flow on demand; that run sets the flag too.
+`GET /api/theme/boot` exposes it beside the other first-run flags. The frontend
+mirrors it in `localStorage['mc-crewmates-onboarded']` as a render cache only,
+and — like `privacy_acked` — treats a workspace that was already `onboarded`
+before this chapter existed as done locally (never persisted): an existing user
+is not interrupted and reaches the flow from the Crewmates page, while a new
+user, whose tour completes in the same session, flows straight on. A new user
+who reloads or restarts BETWEEN the tour and this chapter is still due it: the
+tour's completion (`markOnboarded`) leaves `localStorage['mc-crewmates-pending']`
+on that browser, the seed and the boot rule both exempt a workspace carrying the
+mark from the "already onboarded counts as done" heuristic, and the mark is
+cleared when the chapter is marked done. Only a workspace onboarded with no such
+mark -- before this shipped, or from another machine -- is treated as an existing
+install. The same rule keeps the E2E and capture harnesses, which seed only
+`mc-onboarded`, clear of the chapter.
 
 ### `ChannelConfig.from_dict(data: dict) -> ChannelConfig`
 Parses a channel config entry from JSON. Invalid activation values fall back to `"mention"`.
