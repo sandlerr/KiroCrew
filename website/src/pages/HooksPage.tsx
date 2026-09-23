@@ -16,6 +16,7 @@ import { useSortableTable } from '../hooks/useSortableTable'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import { useArmedDelete } from '../hooks/useArmedDelete'
 import SortableHeader from '../components/SortableHeader'
+import { EVENTS, KAS_ONLY_EVENTS, AGENT_REQUESTED_EVENTS } from './hookEventWireValues'
 
 import { i18nT } from '../i18n/t'
 interface Hook {
@@ -34,7 +35,6 @@ interface HookTestResult {
   stderr?: string
 }
 
-const EVENTS = ['AgentSpawn', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']
 const MATCHER_MODES = ['glob', 'regex', 'contains']
 
 const EVENT_STYLE: Record<string, string> = {
@@ -43,14 +43,46 @@ const EVENT_STYLE: Record<string, string> = {
   PreToolUse: 'bg-aim-subtle text-aim border-aim/30',
   PostToolUse: 'bg-aim-subtle text-aim border-aim/30',
   Stop: 'bg-warn-subtle text-warn border-warn/30',
+  PreTaskExecution: 'bg-aim-subtle text-aim border-aim/30',
+  PostTaskExecution: 'bg-aim-subtle text-aim border-aim/30',
+  FileCreated: 'bg-ok-subtle text-ok border-ok/30',
+  FileEdited: 'bg-ok-subtle text-ok border-ok/30',
+  FileDeleted: 'bg-warn-subtle text-warn border-warn/30',
+  UserTriggered: 'bg-accent/15 text-accent border-accent/30',
 }
 
 const EVENT_BADGE: Record<string, 'ok' | 'err' | 'warn' | 'aim'> = {
   AgentSpawn: 'ok', UserPromptSubmit: 'ok',
   PreToolUse: 'aim', PostToolUse: 'aim', Stop: 'warn',
+  PreTaskExecution: 'aim', PostTaskExecution: 'aim',
+  FileCreated: 'ok', FileEdited: 'ok', FileDeleted: 'warn',
+  UserTriggered: 'ok',
 }
 
 const EVENT_ORDER = Object.fromEntries(EVENTS.map((e, i) => [e, i]))
+
+/** The mark an event carries when no event fires it, or undefined when one does.
+ *
+ *  Two marks, not one: the distance to running differs. A task trigger is asked
+ *  for by an agent and waits only on this side answering; a file or manual
+ *  trigger is not asked for at all. One mark for both would be a promise to
+ *  four of them that nothing has made. */
+const dormantMark = (event: string): string | undefined =>
+  !KAS_ONLY_EVENTS.includes(event) ? undefined
+    : AGENT_REQUESTED_EVENTS.includes(event)
+      ? i18nT('pages.hooksPage.awaiting_agent')
+      : i18nT('pages.hooksPage.stored_only')
+
+/** What the mark means, in user terms, for the badge's own tooltip.
+ *
+ *  Two hints, because the two marks differ on the only thing a reader cares
+ *  about: whether it will ever run by itself. One shared sentence made a reader
+ *  read the help twice and still not know which of their hooks would run. */
+const dormantHint = (event: string): string | undefined =>
+  !KAS_ONLY_EVENTS.includes(event) ? undefined
+    : AGENT_REQUESTED_EVENTS.includes(event)
+      ? i18nT('pages.hooksPage.runs_on_no_event_yet')
+      : i18nT('pages.hooksPage.runs_only_via_test')
 
 const normalizeEvent = (e: string) => e.charAt(0).toUpperCase() + e.slice(1)
 
@@ -99,8 +131,31 @@ function HookForm({ hook, onSave, onCancel }: {
           <Input placeholder={i18nT('pages.hooksPage.hook_name')} value={name} onChange={e => setName(e.target.value)} />
           <SimpleSelect
             options={EVENTS}
-            value={event}
+            // The panel is the trigger's width by default, and the trigger hugs a
+            // short value like `Stop` — so `PostTaskExecution` plus its mark clipped
+            // to "waiti". Wide enough for the longest option and badge together.
+            contentClassName="min-w-[19rem]"
+            // The mark rides the OPTION, which is where the choice is made; the
+            // option's value and accessible name stay the bare wire value, and the
+            // touch path spells the same fact as `name -- mark`.
+            optionBadges={EVENTS.map(e => {
+              const mark = dormantMark(e)
+              // The hint rides the badge, not just the table's copy of it:
+              // the moment of choice is here, and a reader who has never
+              // seen the table cannot tell `waiting` from `stored`.
+              return mark
+                ? { label: mark, source: 'kirocrew', hint: dormantHint(e) }
+                : undefined
+            })}
+            // Choosing a dormant trigger does NOT clear `matcher`, it only hides
+            // the field and drops the value AT SAVE. Clearing it on selection let
+            // an ordinary two-click exploration — PreToolUse to FileEdited and back —
+            // silently widen a stored `fs_write` hook to every tool call, with no
+            // restore path and nothing on screen saying so. Nothing is discarded
+            // invisibly either, which was the original objection: while the field is
+            // gone the line in its place says the trigger takes no matcher.
             onChange={setEvent}
+            value={event}
             // A hook stored with an event this picker no longer offers (legacy
             // or hand-edited config) matches no row. A native <select> silently
             // displayed the FIRST option while state held the stale value; show
@@ -123,14 +178,28 @@ function HookForm({ hook, onSave, onCancel }: {
               breaking, so a sibling that does not fit wraps instead: 231px worst
               case, never below 120px. Same idiom as the tokens row in
               WebhooksPage, which had the identical defect. */}
-          <Input className="basis-full sm:basis-auto" placeholder={matcherPlaceholder} value={matcher} onChange={e => setMatcher(e.target.value)} />
-          {!isToolHook && (
+          {/* No matcher for a trigger no event fires: the store refuses one there,
+              because a matcher filters something in the event's payload and these
+              events have no payload yet. Offering the field would be a form that
+              cannot save. Timeout stays — Test honours it. */}
+          {!dormantMark(event) && (
+            <Input className="basis-full sm:basis-auto" placeholder={matcherPlaceholder} value={matcher} onChange={e => setMatcher(e.target.value)} />
+          )}
+          {!isToolHook && !dormantMark(event) && (
             <SimpleSelect
               options={MATCHER_MODES}
               value={matcherMode}
               onChange={setMatcherMode}
               aria-label={i18nT('pages.hooksPage.matcher_mode')}
             />
+          )}
+          {/* Two fields disappearing with no word for it left the reader
+              guessing at a bug. One line where they were says which fact
+              removed them. */}
+          {dormantMark(event) && (
+            <span className="basis-full sm:basis-auto text-[13px] text-muted">
+              {i18nT('pages.hooksPage.no_matcher_for_trigger')}
+            </span>
           )}
           <div className="flex items-center gap-1.5 text-[13px] text-muted shrink-0">
             <span>{i18nT('pages.hooksPage.timeout')}</span>
@@ -151,8 +220,33 @@ function HookForm({ hook, onSave, onCancel }: {
             </span>
           </div>
         )}
+        {/* A `title` tooltip is the wrong and only home for the decode: no touch
+            device and no keyboard reaches it, and a reader who does not hover never
+            learns what `waiting` and `stored` mean. Here it is ordinary text, beside
+            the very mark it explains, at the moment the trigger is chosen. */}
+        {dormantMark(event) && (
+          <div className="flex items-center gap-2 text-[13px] text-muted">
+            <Badge variant="muted">{dormantMark(event)}</Badge>
+            <span>{dormantHint(event)}</span>
+          </div>
+        )}
+        {/* A NEW hook on a dormant trigger is stored switched off, and a row that
+            came back dimmed with its switch off read as a failed save — whose
+            natural repair, flipping it on, is exactly the pre-authorisation the
+            off state exists to prevent. Say it before Save, not after.
+
+            Creation only: `update` carries no `enabled`, so editing a hook that
+            was deliberately switched ON leaves it on, and this line would be
+            false there. */}
+        {!hook && dormantMark(event) && (
+          <div className="text-[13px] text-muted">
+            {i18nT('pages.hooksPage.saved_switched_off')}
+          </div>
+        )}
         <div className="flex gap-2 items-center">
-          <SendBtn onClick={() => onSave({ name, event, matcher, matcher_mode: matcherMode, command, skills, timeout })}>{i18nT('pages.hooksPage.save')}</SendBtn>
+          {/* The matcher is dropped HERE, for a trigger whose payload cannot be
+              filtered, so the value survives a round trip through the picker. */}
+          <SendBtn onClick={() => onSave({ name, event, matcher: dormantMark(event) ? '' : matcher, matcher_mode: matcherMode, command, skills, timeout })}>{i18nT('pages.hooksPage.save')}</SendBtn>
           <Btn onClick={onCancel} className="h-9 px-4 text-sm font-semibold rounded-lg">{i18nT('pages.hooksPage.cancel')}</Btn>
         </div>
       </div>
@@ -401,7 +495,27 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                         {/* The persisted last_error is not tooltip-only: the
                             chevron expands it beneath the row as an ErrorNotice
                             (the status column is too narrow to hold it inline). */}
-                        {!h.last_status ? <span className="text-muted italic">—</span>
+                        {/* The mark and the result are different kinds of fact —
+                            whether anything fires this trigger, and how the last run
+                            went — so they SHARE the cell rather than replace each
+                            other. A Tested dormant hook otherwise lost the row's only
+                            "this never fires on its own" statement for good, and the
+                            reader was left with a bare OK on a hook nothing runs.
+
+                            `muted`, not `warn`: amber beside a green OK read as a
+                            fault, and a designed dormant state is not one. The mark
+                            is short enough to fit the column, so it carries its own
+                            decode in `title` rather than sending the reader to the
+                            panel's "?". */}
+                        <span className="inline-flex items-center gap-1 flex-wrap">
+                          {dormantMark(h.event) && (
+                            <Badge variant="muted" title={dormantHint(h.event)}>{dormantMark(h.event)}</Badge>
+                          )}
+                          {/* An em dash reads as "has not run yet", which is the
+                              wrong story for a row nothing will ever run — so the
+                              mark stands alone there instead. */}
+                          {!h.last_status
+                          ? (dormantMark(h.event) ? null : <span className="text-muted italic">—</span>)
                           : h.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.hooksPage.ok')}</Badge>
                           : (
                             <span className="inline-flex items-center gap-1">
@@ -419,6 +533,7 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                               )}
                             </span>
                           )}
+                        </span>
                       </td>
                       <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{timeAgo(h.last_run)}</td>
                       {/* Pinned like the header cell, on an OPAQUE `bg-card`.
