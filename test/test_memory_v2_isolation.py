@@ -596,7 +596,13 @@ class TestConsolidatorStoreResolution:
         watch(ctx.ContextBuilder, "get_memory_for")
         watch(MemoryStore, "read_preferences")
         watch(MemoryStore, "read_projects")
-        model = AsyncMock(return_value={"history_entry": "The member finished its task."})
+        reads_before_model: list[int] = []
+
+        async def model(*args, **kwargs):
+            reads_before_model.append(calls.count("read_session_execution"))
+            return {"history_entry": "The member finished its task."}
+
+        model = AsyncMock(side_effect=model)
         monkeypatch.setattr(consolidator, "_call_llm", model)
 
         if unavailable:
@@ -605,7 +611,6 @@ class TestConsolidatorStoreResolution:
         else:
             await consolidator._consolidate(KEY)
 
-        assert calls.count("read_session_execution") == 1
         if unavailable:
             model.assert_not_awaited()
             assert calls == ["read_session_execution"]
@@ -613,6 +618,12 @@ class TestConsolidatorStoreResolution:
             assert ctx._vector_stores == {}
         else:
             model.assert_awaited_once()
+            # The identity is resolved from ONE execution-record read before the
+            # model call; the two further reads are the mode re-checks at the
+            # pass's durable write boundaries (the member-memory write, the
+            # offset advance), every one of them off the loop like the first.
+            assert reads_before_model == [1]
+            assert calls.count("read_session_execution") == 3
             assert {
                 "memory_store_version",
                 "get_memory_for",
