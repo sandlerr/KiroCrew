@@ -52,6 +52,7 @@ from kiro_crew.config.loader import (
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
+from kiro_crew.crewmate_prune_migration import prune_synced_crewmates
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -3271,6 +3272,97 @@ def _register_workflow_lifecycle(app: web.Application, state: DashboardState) ->
     app.on_cleanup.append(_workflow_shutdown)
 
 
+# How long a mutating request waits for the startup crewmate prune before it is
+# answered 503. The pass is marker-gated and runs immediately after the bind, so
+# on every boot but the first after the upgrade the wait is the few milliseconds
+# the pass takes to find the marker; on that first boot it is one config read
+# and one scan of the session metadata lines.
+_CREWMATE_PRUNE_GATE_TIMEOUT_S = 60.0
+_CREWMATE_PRUNE_GATE_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _register_crewmate_prune_gate(app: web.Application, state: DashboardState) -> None:
+    """Arm the crewmate-prune barrier before bind; the pass itself runs after.
+
+    The startup prune (``crewmate_prune_migration``) decides from chat history
+    and the DM bindings which sync-generated crewmates were never used, then
+    deletes their rows. Every writer that can bind an agent to a session while
+    the gateway is up reaches it through a mutating request -- the chat send,
+    slot create, slot agent switch, member thread, channel and import routes
+    under ``/api/``, and the OpenAI-compatible ``POST /v1/chat/completions`` --
+    so ONE middleware holds every non-safe-method request until the pass
+    settles, with no path list to keep in step with the route table. Nothing
+    else writes sessions while the pass runs: the cron scheduler, the Slack
+    socket and the channel relaunches all start after ``start_dashboard``
+    returns (see ``GatewayOrchestrator.run``), and the pass completes inside it.
+
+    Armed HERE, before ``_start_site`` binds the listener, so no request can
+    pass between the bind and the pass. The pass itself is kicked as a tracked
+    background task right after the bind (``_kick_crewmate_prune``) and sets
+    ``crewmate_prune_settled`` in its ``finally``, so the hold is the pass
+    alone and readiness is not gated by it. Reads are never held: the gate
+    applies to mutating methods only, and its fast path is one ``is_set()``
+    read, which is what every request pays once the pass has settled.
+    """
+    state.crewmate_prune_settled.clear()
+
+    @web.middleware
+    async def _crewmate_prune_gate(request: web.Request, handler: Any) -> web.StreamResponse:
+        if (
+            request.method not in _CREWMATE_PRUNE_GATE_SAFE_METHODS
+            and not state.crewmate_prune_settled.is_set()
+        ):
+            try:
+                await asyncio.wait_for(
+                    state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                return web.json_response(
+                    {
+                        "error": "Crewmates are being tidied; retry shortly.",
+                        "code": "prune_in_progress",
+                    },
+                    status=503,
+                )
+        return await handler(request)
+
+    app.middlewares.append(_crewmate_prune_gate)
+
+
+def _kick_crewmate_prune(state: DashboardState) -> None:
+    """Run the one-time crewmate prune as a tracked background task, post-bind.
+
+    ``prune_synced_crewmates`` scans the first line of every session file, so
+    its cost scales with the user's history and it must not sit between the
+    bind and ``KIROCREW_READY`` (``no-new-work-on-gateway-boot-path``, item 3).
+    Same shape as ``_kick_knowledge_orphan_reclaim``: kicked after ``_start_site``
+    returns, run on a worker thread (config lock and file reads are IO). The
+    gate armed before the bind holds every mutating request until the event is
+    set, which happens in ``finally`` whatever the pass does; ``start_dashboard``
+    awaits the same event before the slot restores so a removed crewmate's DM
+    slot is not rebuilt. On every boot but the first after the upgrade the pass
+    is one marker stat.
+    """
+
+    async def _run() -> None:
+        try:
+            prune = await asyncio.to_thread(prune_synced_crewmates, state.conversation_log)
+            if prune.removed:
+                logger.info(
+                    "removed %d unused auto-generated crewmates: %s",
+                    len(prune.removed),
+                    ", ".join(prune.removed),
+                )
+        except Exception:  # noqa: BLE001 -- the pass never raises for unreadable history
+            logger.warning("crewmate prune migration failed", exc_info=True)
+        finally:
+            state.crewmate_prune_settled.set()
+
+    task = asyncio.create_task(_run())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _kick_workflow_initialization(state: DashboardState) -> None:
     """Called only after listener bind and successful credential publication."""
     if state.workflow_startup_task is not None or state.workflow_startup_stopping:
@@ -5269,6 +5361,7 @@ async def start_dashboard(
         _register_browser_view_cleanup(app, state)
         _register_connections_warm_lifecycle(app, state)
         _register_workflow_lifecycle(app, state)
+        _register_crewmate_prune_gate(app, state)
 
         # Unix-socket cleanup hook — registered before runner.setup freezes the
         # signal lists; the path itself only becomes known after the site starts
@@ -5304,6 +5397,13 @@ async def start_dashboard(
     # The listener is up -- keep it up. One failed accept() on Windows would
     # otherwise close it for the life of the process (see listener_guard).
     _arm_listener_guard(state, runner, site)
+    # One-time prune of the crewmates an enrol-on-mount agent sync generated
+    # from the user's own specs (see crewmate_prune_migration). Kicked here,
+    # right after the bind, as a tracked background task -- its cost scales
+    # with the session count, so it stays off the boot path -- while the gate
+    # armed before the bind holds every mutating request until it settles. The
+    # slot restores below await the same event.
+    _kick_crewmate_prune(state)
     # (No _export_bound_port republish here: the reservation above already
     # exported this same socket's name before the spawn pass — the one
     # authoritative write on this path. The headless entrypoint, which binds
@@ -5800,6 +5900,17 @@ async def start_dashboard(
         # messages, so starting up without it is safe.
         logger.warning("channel transcript migration failed", exc_info=True)
 
+    # The crewmate prune must have settled before a DM slot is rebuilt: a slot
+    # pointing at a row the pass removes would otherwise come back. Bounded by
+    # the same budget the request gate uses; the pass sets the event in
+    # ``finally`` whatever it does, so this only trips on a wedged worker, and
+    # then restoring late beats never restoring.
+    try:
+        await asyncio.wait_for(
+            state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        logger.warning("crewmate prune has not settled; restoring sessions without it")
     # Session restores spawn a kiro-cli process per restored tab — the last
     # large group of the startup battery, so it too gets a cautious-boot window.
     await cautious_boot.pause_before("session restore")
